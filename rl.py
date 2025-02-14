@@ -14,7 +14,12 @@ PORTFOLIO_HOLDINGS = [
     'IWR', 'IWP', 'IWS', 
  ]
 
-# ---------------- 1. Load Data ----------------
+""" 
+  ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │ Train & Evaluate                                                                                                 │
+  └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+"""
+
 class PortfolioEnv:
     """
     A custom environment for portfolio optimization using reinforcement learning.
@@ -57,6 +62,8 @@ class PortfolioEnv:
         self.state_size = len(self.feature_columns) * window_size
         self.num_assets = len(self.portfolio_columns)
         
+        self.current_step = self.end_idx
+
         # Print setup information
         print("\nEnvironment Configuration:")
         print(f"Number of features: {len(self.feature_columns)}")
@@ -113,9 +120,22 @@ class PortfolioEnv:
         Returns:
             torch.Tensor: Flattened vector of historical features, shape (state_size,)
         """
-        start = self.current_step - self.window_size
-        obs = self.data.iloc[start:self.current_step][self.feature_columns].values.flatten()
+        # start = self.current_step - self.window_size
+        # obs = self.data.iloc[start:self.current_step][self.feature_columns].values.flatten()
+        # return torch.tensor(obs, dtype=torch.float32)
+
+        # For prediction case, when we're at the end of the data
+        if self.current_step >= len(self.data) - 1:
+            start = len(self.data) - self.window_size
+            end = len(self.data)
+        else:
+            start = self.current_step - self.window_size + 1
+            end = self.current_step + 1
+        
+        # Get window of feature data and flatten
+        obs = self.data.iloc[start:end][self.feature_columns].values.flatten()
         return torch.tensor(obs, dtype=torch.float32)
+
 
     def reset(self):
         """
@@ -426,14 +446,6 @@ def evaluate_agent():
     for asset, alloc in zip(PORTFOLIO_HOLDINGS, avg_allocation):
         print(f"{asset}: {alloc:.2%}")
 
-""" 
-  ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │ Train & Evaluate                                                                                                 │
-  └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-"""
-
-train_agent()
-evaluate_agent()
 
 
 
@@ -445,66 +457,187 @@ evaluate_agent()
   │ Predict                                                                                                          │
   └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 """
-
 def prepare_current_data(raw_data_path, output_path):
     """
     Prepare current market data in the format expected by the model.
+    Uses the last window_size rows from training data to ensure exact matching.
     """
-    # Read and process current market data
-    data = pd.read_csv(raw_data_path)
+    # Load training data with date index
+    training_data = pd.read_csv("data.csv", index_col=0, parse_dates=True)
+    window_size = 12
     
-    # Ensure all required columns exist
-    required_columns = [col for col in PORTFOLIO_HOLDINGS]
-    missing = [col for col in required_columns if col not in data.columns]
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}")
+    # Get exact feature columns from training data
+    feature_columns = [col for col in training_data.columns if "_fwd_" not in col]
     
-    # Add placeholder forward return columns
+    # Take the last window_size rows as is
+    processed_data = training_data.iloc[-window_size:].copy()
+    
+    # Keep only feature columns and add placeholder returns
     for col in PORTFOLIO_HOLDINGS:
-        data[f"{col}_fwd_1y"] = 0  # placeholder, not used for prediction
+        processed_data[f"{col}_fwd_1y"] = 0
     
-    # Save processed data
-    data.to_csv(output_path)
+    print(f"\nData Preparation:")
+    print(f"Using last {window_size} rows from training data")
+    print(f"Number of features: {len(feature_columns)}")
+    print(f"Date range: {processed_data.index[0]} to {processed_data.index[-1]}")
+    
+    # Save with date index preserved
+    processed_data.to_csv(output_path, index=True, header=True)
     return output_path
 
 
-
 def get_current_allocation(new_data_path, model_path='trained_portfolio_agent.pth'):
-    """
-    Get portfolio allocation suggestion for current market conditions.
+    """Get portfolio allocation suggestion for current market conditions."""
+    # Load model
+    checkpoint = torch.load(model_path)
     
-    Args:
-        new_data_path: Path to CSV with recent market data
-        model_path: Path to saved model parameters
-    
-    Returns:
-        dict: Mapping of assets to suggested allocation weights
-    """
-    # Create environment with same parameters as training
+    # Create environment with explicit index and header handling
     env = PortfolioEnv(
         data_path=new_data_path,
+        window_size=12,
         portfolio_columns=PORTFOLIO_HOLDINGS
     )
     
-    # Create agent with same architecture
+    # Set current_step to ensure we use the last window of data
+    env.current_step = len(env.data) - 1
+    
+    # Create agent and load trained parameters
     agent = SACAgent(state_dim=env.state_size, action_dim=env.num_assets)
-    
-    # Load trained parameters
-    checkpoint = torch.load(model_path)
     agent.actor.load_state_dict(checkpoint['actor_state_dict'])
-    agent.actor.eval()  # Set to evaluation mode
+    agent.actor.eval()
     
-    # Get current state
+    # Get prediction
     state = env._get_observation()
     
-    # Get allocation without exploration
+    # Debug prints
+    print(f"\nPrediction Details:")
+    print(f"Data shape: {env.data.shape}")
+    print(f"Current step: {env.current_step}")
+    print(f"State shape: {state.shape}")
+    
     with torch.no_grad():
         allocation = agent.select_action(state, explore=False)
     
-    # Create dictionary of allocations
+    # Format results
     portfolio = {
         asset: float(weight) 
         for asset, weight in zip(PORTFOLIO_HOLDINGS, allocation)
     }
     
+    print(f"\nAllocation as of: {env.data.index[-1]}")
     return portfolio
+""" 
+  ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │ Runtime                                                                                                          │
+  └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+"""
+
+def main():
+
+    ### Training
+    # train_agent()
+    # evaluate_agent()
+
+
+    ### Inference
+    current_data = prepare_current_data('data.csv', 'current_market_data.csv')
+    allocation = get_current_allocation('current_market_data.csv')
+    
+    print("\nFinal Portfolio Allocation:")
+    print("-" * 40)
+    for asset, weight in sorted(allocation.items()):
+        print(f"{asset:4s}: {weight:7.2%}")
+    print("-" * 40)
+
+# main()
+
+
+
+
+""" 
+  ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │ Analyze Model                                                                                                    │
+  └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+"""
+
+def analyze_model_weights(model_path='trained_portfolio_agent.pth'):
+    """Analyze and display the weights of the trained model"""
+    # Load model
+    checkpoint = torch.load(model_path)
+    
+    # Get actor network weights
+    actor_weights = checkpoint['actor_state_dict']
+    
+    print("\nModel Weight Analysis:")
+    print("-" * 40)
+    
+    # Layer by layer analysis
+    for layer_name, weights in actor_weights.items():
+        print(f"\n{layer_name}:")
+        print(f"Shape: {weights.shape}")
+        print(f"Mean: {weights.mean():.4f}")
+        print(f"Std: {weights.std():.4f}")
+        print(f"Min: {weights.min():.4f}")
+        print(f"Max: {weights.max():.4f}")
+
+
+def visualize_model_weights(model_path='trained_portfolio_agent.pth'):
+    """Create visualizations of model weights"""
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    
+    # Load model
+    checkpoint = torch.load(model_path)
+    actor_weights = checkpoint['actor_state_dict']
+    
+    # Create subplots for each layer
+    n_layers = len(actor_weights)
+    fig, axes = plt.subplots(n_layers, 1, figsize=(10, 5*n_layers))
+    
+    for (layer_name, weights), ax in zip(actor_weights.items(), axes):
+        # Convert weights to numpy for plotting
+        weights_np = weights.numpy()
+        
+        # Create heatmap
+        sns.heatmap(weights_np.reshape(1, -1), ax=ax, cmap='coolwarm', center=0)
+        ax.set_title(f'{layer_name} Weight Distribution')
+        ax.set_ylabel('Neurons')
+    
+    plt.tight_layout()
+    plt.savefig('model_weights.png')
+    plt.close()
+    
+    print(f"\nWeight visualization saved as 'model_weights.png'")
+
+def analyze_asset_influences(model_path='trained_portfolio_agent.pth'):
+    """Analyze which features most influence each asset allocation"""
+    checkpoint = torch.load(model_path)
+    final_layer = checkpoint['actor_state_dict']['fc3.weight'].numpy()
+    
+    print("\nAsset Influence Analysis:")
+    print("-" * 40)
+    
+    for asset_idx, asset in enumerate(PORTFOLIO_HOLDINGS):
+        weights = final_layer[asset_idx]
+        strongest_influences = np.argsort(np.abs(weights))[-5:]  # top 5 influences
+        
+        print(f"\n{asset} most influenced by:")
+        for idx in strongest_influences[::-1]:
+            print(f"  Weight {weights[idx]:.4f} at position {idx}")
+
+
+# analyze_model_weights()
+# visualize_model_weights()
+analyze_asset_influences()
+""" 
+  ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │ QA                                                                                                               │
+  └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ """
+# def verify_dimensions():
+#     training_data = pd.read_csv("data.csv")
+#     features = [col for col in training_data.columns if "_fwd_" not in col]
+#     print(f"Number of features: {len(features)}")
+#     print(f"Expected state size: {len(features) * 12}")
+    
+# verify_dimensions()
